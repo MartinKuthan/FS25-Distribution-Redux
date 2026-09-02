@@ -115,8 +115,8 @@
         <text name="dr_status_short_blocked"  text="Block" />
         <text name="dr_status_short_none"     text="-" />
         <text name="dr_col_productionLines"   text="PRODUKTIONSLINJER" />
-        <text name="dr_col_lineInput" text="INGÅNG" />
-        <text name="dr_col_lineOutput" text="UTGÅNG" />
+        <text name="dr_col_lineInput"         text="INKOMMANDE" />
+        <text name="dr_col_lineOutput"        text="UTGÅENDE" />
         <!-- "/mo" = per månad. Siffran är linjens månatliga mål. -->
         <text name="dr_col_targetMo"          text="MÅL /mån" />
 
