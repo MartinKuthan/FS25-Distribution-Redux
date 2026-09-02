@@ -343,6 +343,99 @@ local function fillTypeTitle(ft)
     return tostring(ft)
 end
 
+-- ----- ICON TOOLTIPS ----------------------------------------------------------------------------
+-- Hovering a product icon shows the product NAME next to the cursor. The label is never translated
+-- here: it is the already localized text the page has (the recipe name, else the fill type title), so
+-- modded products read exactly as the game names them. Icons register themselves in a weak-keyed
+-- table when they are drawn, so recycled list cells cannot keep a stale label alive.
+local tooltipIcons = setmetatable({}, { __mode = "k" })
+local hoverTooltip = nil            -- { text, mx, my, t } -- t counts the dwell before showing
+local TOOLTIP_DELAY_MS = 250
+
+local function setIconTooltip(el, label)
+    if el == nil then return end
+    if type(label) ~= "string" or label == "" then
+        el.drTooltip = nil
+        tooltipIcons[el] = nil
+        return
+    end
+    el.drTooltip = label
+    tooltipIcons[el] = true
+end
+
+-- visible for real: the element AND every ancestor up to the screen
+local function isTrulyVisible(el)
+    local e = el
+    while e ~= nil do
+        if e.visible == false then return false end
+        e = e.parent
+    end
+    return el.getIsVisible == nil or el:getIsVisible()
+end
+
+local function elementHovered(el, mx, my)
+    if el == nil or el.absPosition == nil or el.absSize == nil then return false end
+    if not isTrulyVisible(el) then return false end
+    local w, h = el.absSize[1], el.absSize[2]
+    if w == nil or h == nil or w <= 0 or h <= 0 then return false end
+    if GuiUtils == nil or GuiUtils.checkOverlayOverlap == nil then return false end
+    return GuiUtils.checkOverlayOverlap(mx, my, el.absPosition[1], el.absPosition[2], w, h)
+end
+
+local function findHoveredTooltip(mx, my)
+    for el in pairs(tooltipIcons) do
+        if type(el.drTooltip) == "string" and elementHovered(el, mx, my) then
+            return el.drTooltip
+        end
+    end
+    return nil
+end
+
+-- One frame of hover tracking: the box only appears once the cursor has RESTED on an icon for
+-- TOOLTIP_DELAY_MS, so it does not flicker while the mouse sweeps across the strip. Moving onto a
+-- different icon restarts the dwell; leaving the icons clears the tooltip at once.
+local function updateHoverTooltip(dt)
+    if g_inputBinding == nil or g_inputBinding.getMousePosition == nil then hoverTooltip = nil; return end
+    local mx, my = g_inputBinding:getMousePosition()
+    if mx == nil or my == nil then hoverTooltip = nil; return end
+    local text = findHoveredTooltip(mx, my)
+    if text == nil then hoverTooltip = nil; return end
+    if hoverTooltip ~= nil and hoverTooltip.text == text then
+        hoverTooltip.t = hoverTooltip.t + (dt or 0)
+        hoverTooltip.mx, hoverTooltip.my = mx, my
+    else
+        hoverTooltip = { text = text, mx = mx, my = my, t = 0 }
+    end
+end
+
+
+
+-- Game-styled box: black fill, thin green border, white text; nudged back inside the screen edges.
+local TOOLTIP_BORDER = { 0.22323, 0.40724, 0.00368 }
+local function renderTooltip(mx, my, text)
+    if renderText == nil or drawFilledRect == nil then return end
+    if new2DLayer ~= nil then new2DLayer() end
+    local textSize = (getCorrectTextSize ~= nil) and getCorrectTextSize(0.013) or 0.013
+    local textWidth = (getTextWidth ~= nil) and getTextWidth(textSize, text) or (#text * textSize * 0.55)
+    local padX, padY = 0.008, 0.008
+    local boxW, boxH = textWidth + 2 * padX, textSize + 2 * padY
+    local brdX = 2 * (g_pixelSizeX or 0.0005)
+    local brdY = 2 * (g_pixelSizeY or 0.0009)
+    local bx, by = mx + 0.005, my + 0.013
+    if bx + boxW + brdX > 0.99 then bx = 0.99 - boxW - brdX end
+    if bx - brdX < 0.01 then bx = 0.01 + brdX end
+    if by + boxH + brdY > 0.98 then by = my - boxH - 0.012 end
+    if by - brdY < 0 then by = brdY end
+    drawFilledRect(bx - brdX, by - brdY, boxW + 2 * brdX, boxH + 2 * brdY,
+                   TOOLTIP_BORDER[1], TOOLTIP_BORDER[2], TOOLTIP_BORDER[3], 1)
+    drawFilledRect(bx, by, boxW, boxH, 0, 0, 0, 1)
+    setTextColor(1, 1, 1, 1)
+    setTextAlignment(RenderText.ALIGN_LEFT)
+    setTextBold(false)
+    renderText(bx + padX, by + padY + textSize * 0.12, textSize, text)
+end
+-- ========================== end ICON TOOLTIPS ======================================
+
 -- The "+N blocked" notice row has no product name, so alphabetical sorting would float it to the top.
 -- It is a footer, not a product: move it back to the end. Tolerates several (there is only ever one).
 local function keepNoticeLast(rows)
@@ -461,7 +554,7 @@ local function sortedLineIcons(fts, amounts, names)
         end
         pairsList[#pairsList + 1] = {
             ft = ft, amount = amounts ~= nil and amounts[i] or nil,
-            key = key, low = nm:lower(), i = i,
+            name = nm, key = key, low = nm:lower(), i = i,
         }
     end
 
@@ -470,22 +563,28 @@ local function sortedLineIcons(fts, amounts, names)
         if a.low ~= b.low then return a.low < b.low end
         return a.i < b.i
     end)
-    local outFtsSorted, outAmtsSorted = {}, {}
+    local outFtsSorted, outAmtsSorted, outNamesSorted = {}, {}, {}
     for i = 1, #pairsList do
         outFtsSorted[i] = pairsList[i].ft
         outAmtsSorted[i] = pairsList[i].amount
+        outNamesSorted[i] = pairsList[i].name
     end
-    return outFtsSorted, outAmtsSorted
+    return outFtsSorted, outAmtsSorted, outNamesSorted
 end
 
--- Drawable strip items: an icon (required) plus the optional amount text from the same index.
-local function usableIconSlots(fts, amounts, limit)
+-- Drawable strip items: an icon (required), the optional amount text and the localized product name
+-- carried along for the hover tooltip -- all three from the same index.
+local function usableIconSlots(fts, amounts, names, limit)
     local slots = {}
     for i = 1, #(fts or {}) do
         if #slots >= limit then break end
         local file = fillIconFile(fts[i])
         if file ~= nil and file ~= "" then
-            slots[#slots + 1] = { file = file, num = lineAmountText(amounts ~= nil and amounts[i] or nil) }
+            slots[#slots + 1] = {
+                file = file,
+                num = lineAmountText(amounts ~= nil and amounts[i] or nil),
+                label = names ~= nil and names[i] or nil,
+            }
         end
     end
     return slots
@@ -558,6 +657,7 @@ local function placeItem(cell, numName, iconName, x, unit, s, slot, numW, clipL,
         end
         if icon.setImageFilename ~= nil then icon:setImageFilename(slot.file) end
         icon:setVisible(true)
+        setIconTooltip(icon, slot.label)
     end
 
     return itemW
@@ -618,10 +718,10 @@ end
 -- block shrinks on its own only when it would otherwise reach the STATUS column.
 local function setLineInputIcons(cell, fts, outFts, amts, outAmts, names, outNames)
     -- alphabetical left to right in the player's language, inputs and outputs ordered independently
-    local sFts, sAmts = sortedLineIcons(fts, amts, names)
-    local sOutFts, sOutAmts = sortedLineIcons(outFts, outAmts, outNames)
-    local inSlots = usableIconSlots(sFts, sAmts, MAX_LINE_INPUT_ICONS)
-    local outSlots = usableIconSlots(sOutFts, sOutAmts, MAX_LINE_OUTPUT_ICONS)
+    local sFts, sAmts, sNames = sortedLineIcons(fts, amts, names)
+    local sOutFts, sOutAmts, sOutNames = sortedLineIcons(outFts, outAmts, outNames)
+    local inSlots = usableIconSlots(sFts, sAmts, sNames, MAX_LINE_INPUT_ICONS)
+    local outSlots = usableIconSlots(sOutFts, sOutAmts, sOutNames, MAX_LINE_OUTPUT_ICONS)
     local unit, rowX = linePixelUnit(cell)
     if unit == nil then unit = 1 end
     rowX = rowX or 0
@@ -691,15 +791,19 @@ local function setLineInputIcons(cell, fts, outFts, amts, outAmts, names, outNam
 end
 -- ========================== end PRODUCTION LINE ICON STRIP =========================
 
-local function setIcon(cell, ft)
+local function setIcon(cell, ft, label)
     local iconCell = cell:getAttribute("fillIcon")
     if iconCell == nil then return end
     local file = fillIconFile(ft)
     if file ~= nil and file ~= "" and iconCell.setImageFilename ~= nil then
         iconCell:setImageFilename(file)
         if iconCell.setVisible ~= nil then iconCell:setVisible(true) end
+        -- hover tooltip: the row's own localized product name, else the fill type title
+        if type(label) ~= "string" or label == "" then label = fillTypeTitle(ft) end
+        setIconTooltip(iconCell, label)
     elseif iconCell.setVisible ~= nil then
         iconCell:setVisible(false)
+        setIconTooltip(iconCell, nil)
     end
 end
 
@@ -1088,6 +1192,21 @@ end
 function DistributionProductionsPage:update(dt)
     DistributionProductionsPage:superClass().update(self, dt)
     pcall(tickLineScroll)
+    pcall(updateHoverTooltip, dt)
+end
+
+-- The tooltip is drawn AFTER the frame, so it sits on top of the rows. The base draw takes clipping
+-- arguments in some game versions, so they are passed straight through.
+function DistributionProductionsPage:draw(...)
+    DistributionProductionsPage:superClass().draw(self, ...)
+    if hoverTooltip ~= nil and hoverTooltip.t >= TOOLTIP_DELAY_MS then
+        pcall(renderTooltip, hoverTooltip.mx, hoverTooltip.my, hoverTooltip.text)
+    end
+end
+
+function DistributionProductionsPage:onFrameClose()
+    hoverTooltip = nil
+    DistributionProductionsPage:superClass().onFrameClose(self)
 end
 
 -- ---- SmoothList delegate (four lists, told apart by identity) ---------------
@@ -1132,7 +1251,7 @@ function DistributionProductionsPage:populateCellForItemInSection(list, section,
             SmartDistribution.drawStorageBar(cell, self.selectedAsset, inp.ft, self.selectedRole, "input")
         end
         setStatusCell(cell, self.selectedAsset, inp.ft, self:currentWindow(), self.selectedRole)
-        setIcon(cell, inp.ft)
+        setIcon(cell, inp.ft, inp.name)
         return
     end
 
@@ -1174,7 +1293,7 @@ function DistributionProductionsPage:populateCellForItemInSection(list, section,
     if o.sellTiming ~= nil then method = method .. " - " .. o.sellTiming end
     setc("method", method)
     setOutputStatusCell(cell, self.selectedAsset, o.ft, self:currentWindow(), self.selectedRole)
-    setIcon(cell, o.ft)
+    setIcon(cell, o.ft, o.name)
 end
 
 function DistributionProductionsPage:onListSelectionChanged(list, section, index)
