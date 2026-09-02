@@ -3760,11 +3760,11 @@ function SmartDistribution.formatVolume(v)
         s = s:gsub("%.$", "")                                     -- ...and the bare point it can leave
         unit = SmartDistribution.l10n("dr_unit_kilolitre", " kL")
     end
-    -- thousands separators on the integer part (1,234.567 kL); the decimals must not be grouped
+    -- thousands separators on the integer part (1 234.567 kL); the decimals must not be grouped
     local int, freq = s:match("^(%d+)"), nil
     if int ~= nil and #int > 3 then
         local grouped = int
-        repeat grouped, freq = grouped:gsub("^(%d+)(%d%d%d)", "%1,%2") until freq == 0
+        repeat grouped, freq = grouped:gsub("^(%d+)(%d%d%d)", "%1 %2") until freq == 0
         s = grouped .. s:sub(#int + 1)
     end
     return sign .. s .. unit

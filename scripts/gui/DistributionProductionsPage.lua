@@ -39,13 +39,26 @@ local function applyRowHighlight(cell, active)
     if not active and cell.setSelected ~= nil then pcall(function() cell:setSelected(false) end) end
 end
 
+-- THE one number formatter on this page: thousands separated by a SPACE (not a comma, which reads as
+-- a decimal point in most of the languages this mod ships in), with `decimals` decimal places. Only the
+-- integer part is grouped. decimals = 0 rounds to a whole number.
+local function fmtNum(n, decimals)
+    local s
+    if (decimals or 0) > 0 then
+        s = string.format("%." .. decimals .. "f", n or 0)
+    else
+        s = tostring(math.floor((n or 0) + 0.5))
+    end
+    local int, dec = s:match("^(-?%d+)(.*)$")
+    if int == nil then return s end
+    local k
+    repeat int, k = int:gsub("^(-?%d+)(%d%d%d)", "%1 %2") until k == 0
+    return int .. dec
+end
+
 -- integer liters with thousands separators
 local function fmt(n)
-    n = math.floor((n or 0) + 0.5)
-    local s = tostring(n)
-    local k
-    repeat s, k = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2") until k == 0
-    return s
+    return fmtNum(n, 0)
 end
 
 -- EVERY litre figure on this page goes through here; it delegates to SmartDistribution.formatVolume so
@@ -322,6 +335,362 @@ local function fillIconFile(ft)
     return nil
 end
 
+local function fillTypeTitle(ft)
+    if g_fillTypeManager ~= nil and g_fillTypeManager.getFillTypeByIndex ~= nil then
+        local ok, def = pcall(g_fillTypeManager.getFillTypeByIndex, g_fillTypeManager, ft)
+        if ok and def ~= nil and def.title ~= nil then return def.title end
+    end
+    return tostring(ft)
+end
+
+-- The "+N blocked" notice row has no product name, so alphabetical sorting would float it to the top.
+-- It is a footer, not a product: move it back to the end. Tolerates several (there is only ever one).
+local function keepNoticeLast(rows)
+    if rows == nil then return rows end
+    local kept, notices = {}, {}
+    for i = 1, #rows do
+        if rows[i] ~= nil and rows[i].notice ~= nil then notices[#notices + 1] = rows[i]
+        else kept[#kept + 1] = rows[i] end
+    end
+    if #notices == 0 then return rows end
+    for i = 1, #notices do kept[#kept + 1] = notices[i] end
+    for i = 1, #kept do rows[i] = kept[i] end
+    return rows
+end
+
+-- ============================ PRODUCTION LINE ICON STRIP ============================
+-- A production line row reads as products, not prose:
+--     <amount>x [input icon] ... -->  <amount>x [output icon] ...
+-- The amounts come straight from the line RECIPE (prod.inputs/outputs -> amount), so modded
+-- productions, modded fill types and modded lines all work with no special case. A missing or
+-- non-numeric amount hides the number and keeps the icon; a fill type with no icon file is skipped
+-- whole (number included) and the strip closes up behind it.
+--
+-- The "-->" sits on a FIXED axis so every row on the page lines up under the one above it: inputs are
+-- stacked leftwards from the axis, outputs rightwards from it. The input window is exactly
+-- LINE_IN_WINDOW_SLOTS columns wide -- a line with more inputs scrolls inside that window instead of
+-- shrinking (see the scroll section below), so an icon never changes size between rows.
+local MAX_LINE_INPUT_ICONS = 12
+local MAX_LINE_OUTPUT_ICONS = 8
+local LINE_IN_WINDOW_SLOTS = 6     -- inputs visible at once; a longer list scrolls inside the window
+local LINE_SCROLL_SPEED_PX = 30    -- strip travel speed (reference px per second)
+local LINE_SCROLL_PAUSE = 1.2      -- hold at both ends of the ping-pong travel (seconds)
+local LINE_ICON_W_PX = 24          -- product icon width (matches the XML slots)
+local LINE_COL_PITCH_PX = 44       -- FIXED per-item column width: icon + room for the amount + gap
+local LINE_ARROW_PAD_PX = 16       -- clearance kept on both sides of the "-->"
+local LINE_UNIT_BASE_PX = 86       -- inIcon1 -> inIcon2 spacing in the XML (derives the pixel unit)
+local LINE_AXIS_PX = 296           -- the "-->" axis (matches XML inArrow and the column header)
+local LINE_OUT_AVAIL_PX = 380      -- room for the output block right of the arrow
+local LINE_MIN_SCALE = 0.5         -- outputs never shrink below this
+
+-- The strip MOVES its icons, so an icon's current x is no longer the grid position the XML gave it.
+-- Remember the XML x on first use and always measure from that -- otherwise the pixel unit below
+-- shrinks a little on every populate and the whole strip eventually walks off the row.
+local function slotBaseX(el)
+    if el == nil or el.position == nil then return nil end
+    if el.drBaseX == nil then el.drBaseX = el.position[1] end
+    return el.drBaseX
+end
+
+-- Layout reference pixels -> normalized GUI space, derived from two static XML slots
+-- (inIcon1/inIcon2, LINE_UNIT_BASE_PX apart), so it holds for 16:9, 16:10, ultrawide and low
+-- resolutions with no hardcoded screen constant. Also returns the x of the ROW origin (px 0), which
+-- every other position on the row -- the arrow axis included -- is measured from.
+local function linePixelUnit(cell)
+    local ax = slotBaseX(cell:getAttribute("inIcon1"))
+    local bx = slotBaseX(cell:getAttribute("inIcon2"))
+    if ax == nil or bx == nil then return nil end
+    local d = bx - ax
+    if d <= 0 then return nil end
+    local unit = d / LINE_UNIT_BASE_PX
+    return unit, ax - 44 * unit   -- inIcon1 sits 44px from the row's left edge in the XML
+end
+
+-- Amount per cycle -> the text drawn under the icon ("10x"). Whole numbers carry no decimals, values
+-- below 1 (and untidy values below 10) carry one.
+local function lineAmountText(v)
+    if type(v) ~= "number" or v ~= v or v <= 0 then return nil end
+    local decimals = 0
+    if v < 1 then decimals = 1
+    elseif v < 10 and math.abs(v - math.floor(v + 0.5)) > 0.05 then decimals = 1 end
+    return fmtNum(v, decimals) .. "×"
+end
+
+-- The REAL rendered width of a string: the engine's getTextWidth(size, text) answers in normalized
+-- space for an already normalized font size. Should a game version not expose it, fall back to a
+-- character-count estimate -- never to an error.
+local textWidthCache = {}
+local function measureTextWidth(text, size)
+    if text == nil or text == "" or type(size) ~= "number" or size <= 0 then return 0 end
+    local key = tostring(size) .. "|" .. text
+    local cached = textWidthCache[key]
+    if cached ~= nil then return cached end
+    local w
+    if getTextWidth ~= nil then
+        local ok, res = pcall(getTextWidth, size, text)
+        if ok and type(res) == "number" and res > 0 then w = res end
+    end
+    if w == nil then
+        -- fallback: UTF-8 aware character count * an average glyph width
+        local n = 0
+        for _ in string.gmatch(text, "[%z\1-\127\194-\244][\128-\191]*") do n = n + 1 end
+        w = n * size * 0.55
+    end
+    if #textWidthCache > 4000 then textWidthCache = {} end
+    textWidthCache[key] = w
+    return w
+end
+
+-- DISPLAY ORDER of the strip (left to right): alphabetical in the player's own language, keyed through
+-- DistributionSort.key so diacritics collate correctly (cs/pl/sv/de/...), with a lowercase name as the
+-- fallback key. The amount travels WITH its icon: the pairs (ft + amount) are sorted together, so no
+-- number can end up beside the wrong icon. Recipe data is untouched -- this sorts a throwaway copy.
+local function sortedLineIcons(fts, amounts, names)
+    local pairsList = {}
+    for i = 1, #(fts or {}) do
+        local ft = fts[i]
+        -- 1) the name straight from the recipe (already localized, same text as the lists on the left),
+        -- 2) else the fill type title, 3) else at least its index -- never nil.
+        local nm = names ~= nil and names[i] or nil
+        if type(nm) ~= "string" or nm == "" then nm = fillTypeTitle(ft) end
+        if type(nm) ~= "string" then nm = tostring(nm) end
+        local key = nm:lower()
+        if DistributionSort ~= nil and DistributionSort.key ~= nil then
+            local ok, k = pcall(DistributionSort.key, nm)
+            if ok and type(k) == "string" then key = k end
+        end
+        pairsList[#pairsList + 1] = {
+            ft = ft, amount = amounts ~= nil and amounts[i] or nil,
+            key = key, low = nm:lower(), i = i,
+        }
+    end
+
+    table.sort(pairsList, function(a, b)
+        if a.key ~= b.key then return a.key < b.key end
+        if a.low ~= b.low then return a.low < b.low end
+        return a.i < b.i
+    end)
+    local outFtsSorted, outAmtsSorted = {}, {}
+    for i = 1, #pairsList do
+        outFtsSorted[i] = pairsList[i].ft
+        outAmtsSorted[i] = pairsList[i].amount
+    end
+    return outFtsSorted, outAmtsSorted
+end
+
+-- Drawable strip items: an icon (required) plus the optional amount text from the same index.
+local function usableIconSlots(fts, amounts, limit)
+    local slots = {}
+    for i = 1, #(fts or {}) do
+        if #slots >= limit then break end
+        local file = fillIconFile(fts[i])
+        if file ~= nil and file ~= "" then
+            slots[#slots + 1] = { file = file, num = lineAmountText(amounts ~= nil and amounts[i] or nil) }
+        end
+    end
+    return slots
+end
+
+local function setSlotScale(el, s)
+    if el == nil then return end
+    if el.setSize ~= nil and el.size ~= nil then
+        if el.drBaseSize == nil then el.drBaseSize = { el.size[1], el.size[2] } end
+        el:setSize(el.drBaseSize[1] * s, el.drBaseSize[2] * s)
+    end
+    if el.setTextSize ~= nil and el.textSize ~= nil then
+        if el.drBaseTextSize == nil then el.drBaseTextSize = el.textSize end
+        pcall(el.setTextSize, el, el.drBaseTextSize * s)
+    end
+end
+
+local function baseTextSize(el, fallback)
+    if el == nil then return fallback end
+    return el.drBaseTextSize or el.textSize or fallback
+end
+
+-- Place one strip item: icon on top, amount BELOW it, both centred on the same column axis. Every item
+-- occupies one fixed-width column, so icons and numbers line up across rows however long the number is.
+-- Returns the item width in normalized space.
+local function placeItem(cell, numName, iconName, x, unit, s, slot, numW, clipL, clipR)
+    local iconW = LINE_ICON_W_PX * s * unit
+    local num = numName ~= nil and cell:getAttribute(numName) or nil
+    local icon = iconName ~= nil and cell:getAttribute(iconName) or nil
+
+    if slot == nil then
+        if num ~= nil and num.setVisible ~= nil then num:setVisible(false) end
+        if icon ~= nil and icon.setVisible ~= nil then icon:setVisible(false) end
+        return 0
+    end
+
+    local hasNum = slot.num ~= nil and numW ~= nil and numW > 0
+    local itemW = LINE_COL_PITCH_PX * s * unit
+    local centerX = x + itemW * 0.5
+
+    -- SCROLLING STRIP: an item that would fall even partly outside the window is hidden whole, so
+    -- nothing ever bleeds across the arrow axis or past the column's left edge.
+    if clipL ~= nil and clipR ~= nil then
+        local eps = itemW * 0.02
+        if x < clipL - eps or (x + itemW) > clipR + eps then
+            if num ~= nil and num.setVisible ~= nil then num:setVisible(false) end
+            if icon ~= nil and icon.setVisible ~= nil then icon:setVisible(false) end
+            return itemW
+        end
+    end
+
+    if num ~= nil and num.setVisible ~= nil then
+        if hasNum then
+            setSlotScale(num, s)
+            if num.setPosition ~= nil and num.position ~= nil and num.size ~= nil then
+                -- the text box is centre-aligned, so centring the box centres the number
+                num:setPosition(centerX - num.size[1] * 0.5, num.position[2])
+            end
+            if num.setText ~= nil then num:setText(slot.num) end
+            num:setVisible(true)
+        else
+            num:setVisible(false)
+        end
+    end
+
+    if icon ~= nil and icon.setVisible ~= nil then
+        setSlotScale(icon, s)
+        if icon.setPosition ~= nil and icon.position ~= nil then
+            icon:setPosition(centerX - iconW * 0.5, icon.position[2])
+        end
+        if icon.setImageFilename ~= nil then icon:setImageFilename(slot.file) end
+        icon:setVisible(true)
+    end
+
+    return itemW
+end
+
+-- ----- PING-PONG INPUT STRIP -------------------------------------------------------------------
+-- The input window is exactly LINE_IN_WINDOW_SLOTS columns wide. A line with more inputs slides its
+-- strip inside that window, out and back again like a moving banner -- nothing shrinks and nothing is
+-- dropped, the icons simply take turns. Every row reads the same wall-clock timer, so the rows move in
+-- step rather than jittering against each other. The registry is weak-keyed so recycled list cells
+-- cannot keep a row alive.
+local scrollCells = setmetatable({}, { __mode = "k" })
+
+local function lineScrollOffset(overflow, unit)
+    if overflow == nil or overflow <= 0 then return 0 end
+    local travelPx = overflow / math.max(unit or 1, 1e-6)
+    local travelT = travelPx / LINE_SCROLL_SPEED_PX
+    if travelT <= 0 then return 0 end
+    local now = (getTimeSec ~= nil) and getTimeSec() or 0
+    local period = 2 * (travelT + LINE_SCROLL_PAUSE)
+    local t = now % period
+    if t < LINE_SCROLL_PAUSE then return 0 end
+    t = t - LINE_SCROLL_PAUSE
+    if t < travelT then return overflow * (t / travelT) end
+    t = t - travelT
+    if t < LINE_SCROLL_PAUSE then return overflow end
+    t = t - LINE_SCROLL_PAUSE
+    return overflow * math.max(0, 1 - t / travelT)
+end
+
+-- Draw the input strip at the current scroll phase. Called when a row is populated and then every
+-- frame -- it only moves / hides elements that already exist, a row is never rebuilt.
+local function applyInputStrip(cell, ctx)
+    if cell == nil or ctx == nil then return end
+    local offset = lineScrollOffset(ctx.overflow, ctx.unit)
+    local clipL, clipR = nil, nil
+    if ctx.overflow > 0 then clipL, clipR = ctx.winL, ctx.winR end
+    local x = ctx.startX - offset
+    for i = 1, MAX_LINE_INPUT_ICONS do
+        local slot = ctx.slots[i]
+        local w = placeItem(cell, "inNum" .. i, "inIcon" .. i, x, ctx.unit, ctx.scale, slot,
+                            slot ~= nil and ctx.widths[i] or nil, clipL, clipR)
+        if slot ~= nil then x = x + w end
+    end
+end
+
+-- Advance every registered row by one frame.
+local function tickLineScroll()
+    for cell, ctx in pairs(scrollCells) do
+        applyInputStrip(cell, ctx)
+    end
+end
+
+-- THE WHOLE STRIP, aligned on the arrow axis:
+--    [inputs stacked right up to the arrow]  "-->"  [outputs growing rightwards]
+-- The arrow always sits on LINE_AXIS_PX, which is what keeps the rows aligned under each other.
+-- Inputs never shrink (the window is a fixed column count and a longer list scrolls); the output
+-- block shrinks on its own only when it would otherwise reach the STATUS column.
+local function setLineInputIcons(cell, fts, outFts, amts, outAmts, names, outNames)
+    -- alphabetical left to right in the player's language, inputs and outputs ordered independently
+    local sFts, sAmts = sortedLineIcons(fts, amts, names)
+    local sOutFts, sOutAmts = sortedLineIcons(outFts, outAmts, outNames)
+    local inSlots = usableIconSlots(sFts, sAmts, MAX_LINE_INPUT_ICONS)
+    local outSlots = usableIconSlots(sOutFts, sOutAmts, MAX_LINE_OUTPUT_ICONS)
+    local unit, rowX = linePixelUnit(cell)
+    if unit == nil then unit = 1 end
+    rowX = rowX or 0
+
+    local numSize = baseTextSize(cell:getAttribute("inNum1"), 0.011)
+    local arrowEl = cell:getAttribute("inArrow")
+    local arrowSize = baseTextSize(arrowEl, 0.015)
+    local arrowText = (arrowEl ~= nil and arrowEl.text ~= nil and arrowEl.text ~= "") and arrowEl.text or "-->"
+    local arrowW = measureTextWidth(arrowText, arrowSize)
+    local axisX = rowX + LINE_AXIS_PX * unit
+
+    -- width of one block (and of each amount text in it) at a given scale
+    local function blockWidth(slots, s)
+        local widths = {}
+        for i = 1, #slots do
+            widths[i] = slots[i].num ~= nil and measureTextWidth(slots[i].num, numSize * s) or 0
+        end
+        return #slots * LINE_COL_PITCH_PX * s * unit, widths
+    end
+
+    local function fitBlock(slots, availPx)
+        local s = 1
+        local total = blockWidth(slots, 1)
+        local avail = availPx * unit
+        if total > avail and total > 0 then
+            s = math.max(LINE_MIN_SCALE, avail / total)
+        end
+        local w, widths = blockWidth(slots, s)
+        return s, w, widths
+    end
+
+    -- INPUTS: fixed window of LINE_IN_WINDOW_SLOTS columns, ending LINE_ARROW_PAD_PX short of the axis
+    local winR = axisX - LINE_ARROW_PAD_PX * unit
+    local winW = LINE_IN_WINDOW_SLOTS * LINE_COL_PITCH_PX * unit
+    local winL = winR - winW
+    local inW, inWidths = blockWidth(inSlots, 1)
+    local overflow = math.max(0, inW - winW)
+    -- everything fits: flush right against the arrow. Overflowing: start at the left edge and scroll.
+    local ctx = {
+        slots = inSlots, widths = inWidths, unit = unit, scale = 1,
+        winL = winL, winR = winR, overflow = overflow,
+        startX = (overflow > 0) and winL or (winR - inW),
+    }
+    scrollCells[cell] = (overflow > 0) and ctx or nil
+    applyInputStrip(cell, ctx)
+
+    -- ARROW: always on the axis, so the rows stay aligned
+    if arrowEl ~= nil and arrowEl.setVisible ~= nil then
+        setSlotScale(arrowEl, 1)
+        if arrowEl.setPosition ~= nil and arrowEl.position ~= nil then
+            arrowEl:setPosition(axisX, arrowEl.position[2])
+        end
+        arrowEl:setVisible(true)
+    end
+
+    -- OUTPUTS: start behind the arrow and grow rightwards
+    local outScale, _, outWidths = fitBlock(outSlots, LINE_OUT_AVAIL_PX - LINE_ARROW_PAD_PX)
+    local x = axisX + arrowW + LINE_ARROW_PAD_PX * unit
+    for i = 1, MAX_LINE_OUTPUT_ICONS do
+        local slot = outSlots[i]
+        local w = placeItem(cell, "outNum" .. i, "outIcon" .. i, x, unit, outScale, slot,
+                            slot ~= nil and outWidths[i] or nil)
+        if slot ~= nil then
+            x = x + w
+        end
+    end
+end
+-- ========================== end PRODUCTION LINE ICON STRIP =========================
+
 local function setIcon(cell, ft)
     local iconCell = cell:getAttribute("fillIcon")
     if iconCell == nil then return end
@@ -361,6 +730,12 @@ local function lineLabels(lines)
         end
         local inNames = {}
         for _, inp in ipairs(line.inputs or {}) do inNames[#inNames + 1] = inp.name end
+        -- the products inside a derived label read in the same alphabetical order as the input and
+        -- output LISTS above them, in the player's language (display text only; line data untouched)
+        if DistributionSort ~= nil then
+            DistributionSort.sortStrings(outNames)
+            DistributionSort.sortStrings(inNames)
+        end
         local head = table.concat(outNames, " + ")
         if head == "" then head = line.name or "" end
         if head == "" then head = string.format(SmartDistribution.l10n("dr_label_line", "Line %d"), i) end
@@ -457,6 +832,12 @@ function DistributionProductionsPage:rebuildAssets()
             self.assets[#self.assets + 1] = a
         end
     end
+    -- alphabetical by the displayed building name, roleUid as the stable second key (see DistributionSort)
+    if DistributionSort ~= nil then
+        DistributionSort.sort(self.assets,
+            function(a) return a.name or a.baseName or a.origName end,
+            function(a) return a.roleUid end)
+    end
 end
 
 -- Build the three right-pane sections for the selected building:
@@ -509,9 +890,57 @@ function DistributionProductionsPage:buildSections()
         -- representative monthly production = first output's per-month amount
         local perMonth = 0
         if line.outputs ~= nil and line.outputs[1] ~= nil then perMonth = line.outputs[1].perMonth or 0 end
+        -- INPUT FILL TYPES OF THIS LINE, in the same alphabetical order as the label and the inputs
+        -- list, for the icon strip drawn in front of the line name. Deduplicated, taken from the line's
+        -- OWN recipe (never hardcoded), and simply empty for a line that declares no inputs.
+        local inFts, inSeenFt, inAmtByFt, inNameByFt = {}, {}, {}, {}
+        for _, i in ipairs(line.inputs or {}) do
+            if i.ft ~= nil then
+                if not inSeenFt[i.ft] then
+                    inSeenFt[i.ft] = true
+                    inFts[#inFts + 1] = i.ft
+                end
+                -- RECIPE NAME: already localized; the strip orders its icons alphabetically by it.
+                if type(i.name) == "string" and i.name ~= "" then inNameByFt[i.ft] = i.name end
+                -- AMOUNT PER CYCLE from the line's recipe; repeated entries of one fill type add up.
+                -- A modded line with no numeric "amount" simply gets no number, but keeps its icon.
+                if type(i.amount) == "number" then
+                    inAmtByFt[i.ft] = (inAmtByFt[i.ft] or 0) + i.amount
+                end
+            end
+        end
+        if DistributionSort ~= nil then
+            DistributionSort.sortFillTypes(inFts, function(ft) return fillTypeTitle(ft) end)
+        end
+        -- OUTPUT FILL TYPES OF THIS LINE, deduplicated, alphabetical in the player's language, for the
+        -- "= <product>" icon(s) drawn after the input strip. Taken from the line's own recipe.
+        local outFts, outSeenFt, outAmtByFt, outNameByFt = {}, {}, {}, {}
+        for _, o in ipairs(line.outputs or {}) do
+            if o.ft ~= nil then
+                if not outSeenFt[o.ft] then
+                    outSeenFt[o.ft] = true
+                    outFts[#outFts + 1] = o.ft
+                end
+                if type(o.name) == "string" and o.name ~= "" then outNameByFt[o.ft] = o.name end
+                if type(o.amount) == "number" then
+                    outAmtByFt[o.ft] = (outAmtByFt[o.ft] or 0) + o.amount
+                end
+            end
+        end
+        if DistributionSort ~= nil then
+            DistributionSort.sortFillTypes(outFts, function(ft) return fillTypeTitle(ft) end)
+        end
+        -- amounts and names collected AFTER the sort, so each number stays with its own icon
+        local inAmts, outAmts, inNames, outNames = {}, {}, {}, {}
+        for k = 1, #inFts do inAmts[k] = inAmtByFt[inFts[k]]; inNames[k] = inNameByFt[inFts[k]] end
+        for k = 1, #outFts do outAmts[k] = outAmtByFt[outFts[k]]; outNames[k] = outNameByFt[outFts[k]] end
         self.lines[#self.lines + 1] = {
             id = line.id, name = label, status = line.status, enabled = line.enabled, perMonth = perMonth,
+            inputFts = inFts, outputFts = outFts, inputAmounts = inAmts, outputAmounts = outAmts,
+            inputNames = inNames, outputNames = outNames,
         }
+
+
     end
 
     -- 3) outputs: one row per distinct output fill type (shown only if an enabled line makes it, or there
@@ -573,6 +1002,18 @@ function DistributionProductionsPage:buildSections()
     -- the production's alone and shows on this tab only, so it keeps its own key.
     self.inputs  = filterBlockedRows(p, self.inputs, self:inputRole())
     self.outputs = filterBlockedRows(p, self.outputs, self.selectedRole)
+
+    -- DISPLAY ORDER ONLY (see DistributionSort): each of the three tables is alphabetical by the name
+    -- the player reads, in the active language. Lines keep their id, so Toggle Line still acts on the
+    -- line the row names; outputs keep their ft, so Cycle Output / Sell Timing are unaffected. The
+    -- "+N blocked" notice row carries no name and is pushed back to the end afterwards.
+    if DistributionSort ~= nil then
+        DistributionSort.sort(self.inputs)
+        DistributionSort.sort(self.outputs)
+        DistributionSort.sort(self.lines, function(l) return l.name end, function(l) return l.id end)
+        keepNoticeLast(self.inputs)
+        keepNoticeLast(self.outputs)
+    end
 end
 
 -- The role an INPUT row is addressed by. nil -- i.e. the primary, the silo -- whenever this building
@@ -642,6 +1083,13 @@ function DistributionProductionsPage:onFrameOpen()
     self:setSoundSuppressed(false)
 end
 
+-- One shared frame tick driving the ping-pong scroll of the overflowing input strips. It only moves /
+-- hides elements that already exist -- no row is rebuilt, so it costs next to nothing.
+function DistributionProductionsPage:update(dt)
+    DistributionProductionsPage:superClass().update(self, dt)
+    pcall(tickLineScroll)
+end
+
 -- ---- SmoothList delegate (four lists, told apart by identity) ---------------
 function DistributionProductionsPage:getNumberOfItemsInSection(list, section)
     if list == self.assetList  then return #self.assets end
@@ -692,6 +1140,9 @@ function DistributionProductionsPage:populateCellForItemInSection(list, section,
         local ln = self.lines[index]
         if ln == nil then return end
         setc("name", ln.name)
+        setLineInputIcons(cell, ln.inputFts, ln.outputFts, ln.inputAmounts, ln.outputAmounts,
+                          ln.inputNames, ln.outputNames)
+
         setc("status", ln.status or "")
         setc("prodMo", ln.enabled and fmtV(ln.perMonth) or "")   -- PROD /mo only while the line is ON
         return

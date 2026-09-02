@@ -217,6 +217,7 @@ v1.0.0.1
     </inputBinding>
 
     <extraSourceFiles>
+        <sourceFile filename="scripts/DistributionSort.lua"/>
         <sourceFile filename="scripts/DistributionLimits.lua"/>
         <sourceFile filename="scripts/DistributionModeEvent.lua"/>
         <sourceFile filename="scripts/DistributionSellTimingEvent.lua"/>
